@@ -81,3 +81,17 @@ class Arena:
             if self.solid(x + f * dx, y + f * dy, height, height):
                 return True
         return False
+
+    def blocked(self, start, end):
+        """Sample a direct sight line against the preindexed prism columns."""
+        if not self.columns:
+            return False
+        x, y, z = start
+        dx, dy, dz = (b - a for a, b in zip(start, end))
+        steps = max(1, math.ceil(math.hypot(dx, dy) / self.cell))
+        for i in range(1, steps):
+            f = i / steps
+            height = z + f * dz
+            if self.solid(x + f * dx, y + f * dy, height, height):
+                return True
+        return False
