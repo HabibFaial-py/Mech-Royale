@@ -2,6 +2,7 @@
 import math
 
 import mechfight as mf
+from arena_nav import Arena
 
 
 UPGRADES = ("nanites", "armor", "servos", "plating", "reactor", "jets", "capacitor", "sensors", "gyros")
@@ -53,31 +54,10 @@ def shoot(me, target, height):
             continue
         if not me["stats"]["min_pitch"] <= pitch <= me["stats"]["max_pitch"]:
             continue
-        tolerance = min(0.22, 0.035 + 2.5 / max(1, distance))
-        aligned = angle_error(me["aim"][0], yaw) < tolerance and abs(me["aim"][1] - pitch) < tolerance
         if aim is None:
             aim = [yaw, pitch]
-            if kind == "gun" and (vx or vy or vz):
-                # Preserve V3's trigger check. Anticipate torso slew only
-                # when the gun would have to wait for alignment.
-                turn = 0.0
-                if not aligned:
-                    mech = me["stats"]
-                    turn = max(
-                        (angle_error(me["aim"][0], yaw) - tolerance) / mech["turn_rate"],
-                        (abs(me["aim"][1] - pitch) - tolerance) / mech["pitch_rate"],
-                    )
-                # Update the flight time to the intercept, including targets
-                # that are closing or opening the distance during flight.
-                for _ in range(3):
-                    intercept = turn + flight
-                    lead_x = dx + vx * intercept
-                    lead_y = dy + vy * intercept
-                    lead_z = dz + vz * intercept
-                    flight = math.hypot(lead_x, lead_y, lead_z) / stats["speed"]
-                lead_pitch = math.atan2(lead_z, math.hypot(lead_x, lead_y))
-                aim = [math.atan2(lead_y, lead_x),
-                       max(me["stats"]["min_pitch"], min(lead_pitch, me["stats"]["max_pitch"]))]
+        tolerance = min(0.22, 0.035 + 2.5 / max(1, distance))
+        aligned = angle_error(me["aim"][0], yaw) < tolerance and abs(me["aim"][1] - pitch) < tolerance
         if kind == "lightning":
             aligned = angle_error(me["aim"][0], yaw) < math.radians(stats["cone_deg"]) / 2
         if kind == "laser" and weapon.get("charge", 0) > 0:
@@ -90,16 +70,64 @@ def shoot(me, target, height):
 
 
 class Bot:
-    name = "hybrid-v5"
+    name = "hybrid-v6"
 
     def __init__(self, hello: mf.Hello):
         self.reach = hello["config"]["loot"]["pickup_radius"]
+        self.arena = Arena(hello.get("map", {}).get("dir"))
+        self.pickup_attempt = None
+        self.stalled_pickups = set()
         self.crate_height = hello["config"]["crates"]["height"] / 2
         self.side = 1 if hello["slot"] % 2 else -1
         self.anchor = None
         self.detour_until = -1
         self.detour_yaw = 0
         self.hit_until = -1
+
+    def pickup_move(self, obs):
+        me, zone, now = obs["self"], obs["zone"], obs["t"]
+        x, y, z = me["pos"]
+        stats = me["stats"]
+        radius = stats["radius"]
+        bottom, top = z + stats["step_up"], z + stats["height"]
+        held = {w["kind"] for w in me["weapons"] if w}
+        attempt = self.pickup_attempt
+        pickups = sorted(obs.get("pickups", ()), key=lambda p: (
+            not attempt or p["id"] != attempt[0], math.dist(me["pos"], p["pos"])))
+        for item in pickups:
+            item_id = item["id"]
+            if item_id in self.stalled_pickups or item["kind"] == "gun" or item["kind"] in held:
+                continue
+            ix, iy, iz = item["pos"]
+            distance = math.hypot(ix - x, iy - y)
+            if not self.reach <= distance <= 30 or abs(iz - z) >= 4:
+                continue
+            if math.dist((ix, iy), zone["center"]) > zone["radius"] - 3:
+                continue
+            if now >= zone["shrink_start"] and math.dist((ix, iy), zone["next_center"]) > zone["next_radius"]:
+                continue
+            if attempt and item_id == attempt[0] and now >= attempt[1]:
+                if attempt[2] - distance < 2:
+                    self.stalled_pickups.add(item_id)
+                    continue
+            dx, dy = (ix - x) / distance, (iy - y) / distance
+            # Walk only far enough to collect it. Check the full corridor
+            # for the mech's body, including bridges and the arena boundary.
+            walk = distance - 0.75 * self.reach
+            steps = math.ceil(walk / 1.5)
+            for i in range(1, steps + 1):
+                step = walk * i / steps
+                px, py = x + dx * step, y + dy * step
+                if not self.arena.in_bounds(px, py, radius) or any(
+                    self.arena.solid(px - dy * side, py + dx * side, bottom, top)
+                    for side in (0, radius, -radius)
+                ):
+                    break
+            else:
+                if not attempt or item_id != attempt[0] or now >= attempt[1]:
+                    self.pickup_attempt = (item_id, now + 0.9, distance)
+                return [dx, dy]
+        return None
 
     def act(self, obs: mf.Observation) -> mf.Action:
         me, zone, now = obs["self"], obs["zone"], obs["t"]
@@ -182,6 +210,14 @@ class Bot:
                 if item["kind"] != "gun" and math.hypot(ix - x, iy - y) < self.reach and abs(iz - z) < 4:
                     act["take"] = item["id"]
                     break
+            if ("take" not in act and self.arena.bounds is not None and me["grounded"]
+                    and not (urgent or hurt or drone_near) and now >= self.detour_until
+                    and (enemy is None or math.dist(enemy["pos"], pos) > 80)):
+                move = self.pickup_move(obs)
+                if move is not None:
+                    act["move"] = move
+                    return act
+        self.pickup_attempt = None
         return act
 
 
